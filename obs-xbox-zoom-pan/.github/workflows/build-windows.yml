@@ -1,0 +1,47 @@
+name: Build OBS Plugin (Windows)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      OBS_DEPS_URL: https://github.com/obsproject/obs-deps/releases/download/2025-05-01/win64-deps-2025-05-01.zip
+      OBS_DEPS_DIR: C:\obs-deps
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@v3.30.3
+
+      - name: Download OBS deps (libobs, frontend API, Qt)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:OBS_DEPS_DIR | Out-Null
+          $zip = "$env:RUNNER_TEMP\obs-deps.zip"
+          Invoke-WebRequest -Uri $env:OBS_DEPS_URL -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $env:OBS_DEPS_DIR -Force
+
+      - name: Configure (Ninja, Release)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$env:OBS_DEPS_DIR\lib\cmake"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Stage install
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}\stage"
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-xbox-zoom-pan-windows
+          path: |
+            stage/obs-plugins/64bit/obs-xbox-zoom-pan.dll

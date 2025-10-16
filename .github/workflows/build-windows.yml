@@ -15,35 +15,41 @@ jobs:
       - name: Install CMake + Ninja
         uses: lukka/get-cmake@v3.30.3
 
-      # Find and download the latest obs-deps win64 bundle (robust + retries)
-      - name: Download OBS deps (win64)
+      - name: Get latest obs-deps (win64) with retries
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $retries = 5
-          $delay = 5
+          $retries = 5; $delay = 5
           for ($i=1; $i -le $retries; $i++) {
             try {
-              $release = Invoke-RestMethod -UseBasicParsing https://api.github.com/repos/obsproject/obs-deps/releases/latest
-              $asset = $release.assets | Where-Object { $_.name -match '^win64-deps-.*\.zip$' } | Select-Object -First 1
-              if (-not $asset) { throw "No win64-deps asset found in latest release." }
+              $release = Invoke-RestMethod https://api.github.com/repos/obsproject/obs-deps/releases/latest
+              $asset = $release.assets | Where-Object { $_.name -like 'win64-deps-*.zip' } | Select-Object -First 1
+              if (-not $asset) { throw "No win64-deps asset found" }
+              Write-Host "Latest obs-deps asset:" $asset.name
               $zip = "$env:RUNNER_TEMP\obs-deps.zip"
-              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+              Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+              if (-not (Test-Path $zip)) { throw "Download failed: $zip missing" }
               New-Item -ItemType Directory -Force -Path C:\obs-deps | Out-Null
               Expand-Archive -Path $zip -DestinationPath C:\obs-deps -Force
               break
             } catch {
-              if ($i -eq $retries) { throw $_ }
+              if ($i -eq $retries) { throw }
+              Write-Host "Retry $i failed: $($_.Exception.Message)"
               Start-Sleep -Seconds $delay
             }
           }
+          Write-Host "obs-deps contents:"
+          Get-ChildItem -Recurse C:\obs-deps | Select-Object FullName
 
-      - name: Configure (Ninja Release)
+      - name: Configure (Ninja, verbose)
         shell: pwsh
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_PREFIX_PATH="C:\obs-deps\lib\cmake"
+          -DCMAKE_VERBOSE_MAKEFILE=ON
+          -DCMAKE_PREFIX_PATH="C:\obs-deps;C:\obs-deps\lib\cmake"
+          -Dlibobs_DIR="C:\obs-deps\lib\cmake\libobs"
+          -Dobs-frontend-api_DIR="C:\obs-deps\lib\cmake\obs-frontend-api"
 
       - name: Build
         run: cmake --build build --config Release -j
@@ -51,20 +57,20 @@ jobs:
       - name: Stage install
         run: cmake --install build --config Release --prefix "${{ github.workspace }}\stage"
 
-      - name: Upload artifact (DLL)
+      - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
           name: obs-xbox-zoom-pan-windows
           path: stage/obs-plugins/64bit/obs-xbox-zoom-pan.dll
 
-      # Also upload logs and full stage for debugging if needed
-      - name: Upload build logs and stage (optional)
+      # Always upload logs if anything goes wrong
+      - name: Upload CMake logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-and-stage
+          name: cmake-logs
           path: |
             build/CMakeFiles/CMakeOutput.log
             build/CMakeFiles/CMakeError.log
-            stage/**
+
 

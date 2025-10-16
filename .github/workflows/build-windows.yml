@@ -9,69 +9,101 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout plugin repo
         uses: actions/checkout@v4
 
       - name: Install CMake + Ninja
         uses: lukka/get-cmake@v3.30.3
 
-      # ----------------------------------------------------
-      # 1) Download the official OBS CMake SDK (libobs + frontend API)
-      # ----------------------------------------------------
-      - name: Download OBS Studio SDK (windows-cmake)
+      # ---------------------------------------------
+      # 1) Grab latest obs-deps zips (core + Qt6)
+      # ---------------------------------------------
+      - name: Download obs-deps (core + Qt6)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Get latest OBS release metadata
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
-          $asset = $release.assets | Where-Object { $_.name -match 'windows-cmake\.zip$' } | Select-Object -First 1
-          if (-not $asset) { throw "No windows-cmake SDK asset found in latest release." }
-
-          Write-Host "Downloading OBS SDK asset: $($asset.name)"
-          $zip = Join-Path $env:RUNNER_TEMP $asset.name
-          Invoke-WebRequest $asset.browser_download_url -OutFile $zip
-
-          # Extract to temporary location
-          $sdkDir = Join-Path $env:RUNNER_TEMP 'obs-sdk'
-          New-Item -Force -ItemType Directory $sdkDir | Out-Null
-          Expand-Archive -Path $zip -DestinationPath $sdkDir -Force
-
-          # The CMake configs live inside /cmake/
-          $sdkCmake = Join-Path $sdkDir 'cmake'
-          if (-not (Test-Path "$sdkCmake\libobs\libobsConfig.cmake")) {
-            Write-Error "libobsConfig.cmake not found under $sdkCmake"
+          function Get-ObsDepsAsset([string]$pattern) {
+            # scan recent releases to avoid "latest" pointing to tag without assets
+            $rels = Invoke-RestMethod `
+              -Headers @{ "Authorization"="Bearer $env:GH_TOKEN"; "User-Agent"="obs-xbox-zoom-pan-ci" } `
+              https://api.github.com/repos/obsproject/obs-deps/releases?per_page=25
+            foreach ($r in $rels) {
+              $cand = $r.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+              if ($cand) { return $cand }
+            }
+            throw "No asset matched: $pattern"
           }
 
-          Write-Host "OBS SDK unpacked to: $sdkCmake"
-          echo "OBS_SDK_CMAKE=$sdkCmake" >> $env:GITHUB_ENV
+          $core = Get-ObsDepsAsset 'windows-deps-*-x64.zip'          # libav, other deps for obs
+          $qt6  = Get-ObsDepsAsset 'windows-deps-qt6-*-x64.zip'      # Qt 6 for UI
 
-      # ----------------------------------------------------
-      # 2) Configure CMake for your plugin
-      # ----------------------------------------------------
-      - name: Configure (CMake)
+          Write-Host "Core deps: $($core.name)"
+          Write-Host "Qt6  deps: $($qt6.name)"
+
+          $coreZip = "$env:RUNNER_TEMP\core.zip"
+          $qtZip   = "$env:RUNNER_TEMP\qt6.zip"
+          Invoke-WebRequest $core.browser_download_url -OutFile $coreZip
+          Invoke-WebRequest $qt6.browser_download_url  -OutFile $qtZip
+
+          New-Item -ItemType Directory -Force -Path C:\obs-core | Out-Null
+          New-Item -ItemType Directory -Force -Path C:\obs-qt6  | Out-Null
+          Expand-Archive -Path $coreZip -DestinationPath C:\obs-core -Force
+          Expand-Archive -Path $qtZip  -DestinationPath C:\obs-qt6  -Force
+
+          Write-Host "`n== obs-core cmake packages ==" ; Get-ChildItem C:\obs-core\lib\cmake
+          Write-Host "`n== obs-qt6  cmake packages ==" ; Get-ChildItem C:\obs-qt6\lib\cmake
+
+      # ---------------------------------------------
+      # 2) Build a minimal OBS SDK (libobs + frontend)
+      # ---------------------------------------------
+      - name: Fetch obs-studio source
+        run: git clone --depth 1 https://github.com/obsproject/obs-studio.git
+
+      - name: Configure obs-studio (minimal, Ninja)
+        shell: pwsh
+        run: >
+          cmake -S obs-studio -B obs-build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}\obs-sdk"
+          -DCMAKE_PREFIX_PATH="C:\obs-core\lib\cmake;C:\obs-qt6\lib\cmake"
+          -DBUILD_BROWSER=OFF
+          -DBUILD_VLC=OFF
+          -DBUILD_VST=OFF
+          -DBUILD_QSV=OFF
+          -DBUILD_TESTS=OFF
+          -DENABLE_SCRIPTING=OFF
+          -DENABLE_HEVC=OFF
+
+      - name: Build + install obs-studio SDK (libobs + frontend)
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_VERBOSE_MAKEFILE=ON `
-            -DCMAKE_PREFIX_PATH="$env:OBS_SDK_CMAKE"
+          cmake --build obs-build --config Release --target libobs obs-frontend-api -j
+          cmake --build obs-build --config Release --target install
 
-      # ----------------------------------------------------
-      # 3) Build
-      # ----------------------------------------------------
-      - name: Build
+          Write-Host "`n== Installed SDK cmake dir =="
+          Get-ChildItem -Recurse "${{ github.workspace }}\obs-sdk\cmake"
+
+      # ---------------------------------------------
+      # 3) Build your plugin against the installed SDK
+      # ---------------------------------------------
+      - name: Configure plugin (Ninja, verbose)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_VERBOSE_MAKEFILE=ON
+          -DCMAKE_PREFIX_PATH="${{ github.workspace }}\obs-sdk\cmake;C:\obs-qt6\lib\cmake"
+          --debug-find
+
+      - name: Build plugin
         run: cmake --build build --config Release -j
 
-      # ----------------------------------------------------
-      # 4) Stage / install
-      # ----------------------------------------------------
       - name: Stage install
         run: cmake --install build --config Release --prefix "${{ github.workspace }}\stage"
 
-      # ----------------------------------------------------
-      # 5) Upload DLL artifact
-      # ----------------------------------------------------
       - name: Upload plugin DLL
         uses: actions/upload-artifact@v4
         with:
@@ -79,16 +111,15 @@ jobs:
           path: stage/obs-plugins/64bit/obs-xbox-zoom-pan.dll
           if-no-files-found: warn
 
-      # ----------------------------------------------------
-      # 6) Always upload logs/build folder for troubleshooting
-      # ----------------------------------------------------
-      - name: Upload build + logs (always)
+      - name: Upload build dirs + logs (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-and-logs
           path: |
+            obs-build/**
             build/**
             stage/**
           if-no-files-found: ignore
+
 

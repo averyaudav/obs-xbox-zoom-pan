@@ -2,12 +2,12 @@ name: Build OBS Plugin (Windows)
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest  # or 'windows-2022' if you prefer a fixed image
+    runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,42 +15,74 @@ jobs:
       - name: Install CMake + Ninja
         uses: lukka/get-cmake@v3.30.3
 
-      - name: Install OBS Studio (winget)
+      # Download latest deps zips (libobs/obs-frontend-api + Qt6) from recent releases
+      - name: Download OBS deps (libobs + frontend + Qt6)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          winget install --id OBSProject.OBSStudio -e --accept-source-agreements --accept-package-agreements
-          $cmakeRoot = "$Env:ProgramFiles\obs-studio\cmake"
-          if (-not (Test-Path "$cmakeRoot\libobs\libobsConfig.cmake")) {
-            Write-Error "OBS CMake files not found at $cmakeRoot. Install may have failed."
+          $ErrorActionPreference = 'Stop'
+
+          function Get-ObsDepsAsset([string]$pattern) {
+            $releases = Invoke-RestMethod `
+              -Headers @{ "Authorization" = "Bearer $env:GH_TOKEN"; "User-Agent"="obs-xbox-zoom-pan-ci" } `
+              https://api.github.com/repos/obsproject/obs-deps/releases?per_page=30
+            foreach ($rel in $releases) {
+              $cand = $rel.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+              if ($cand) { return $cand }
+            }
+            throw "No asset found matching $pattern across recent releases."
           }
 
-      - name: Configure (CMake)
+          $core   = Get-ObsDepsAsset 'windows-deps-*-x64.zip'         # libobs + obs-frontend-api
+          $qt6    = Get-ObsDepsAsset 'windows-deps-qt6-*-x64.zip'     # Qt6
+
+          Write-Host "Using core deps asset: $($core.name)"
+          Write-Host "Using qt6  deps asset: $($qt6.name)"
+
+          $coreZip = "$env:RUNNER_TEMP\core.zip"
+          $qtZip   = "$env:RUNNER_TEMP\qt6.zip"
+          Invoke-WebRequest -Uri $core.browser_download_url -OutFile $coreZip
+          Invoke-WebRequest -Uri $qt6.browser_download_url  -OutFile $qtZip
+
+          New-Item -ItemType Directory -Force -Path C:\obs-core  | Out-Null
+          New-Item -ItemType Directory -Force -Path C:\obs-qt6   | Out-Null
+          Expand-Archive -Path $coreZip -DestinationPath C:\obs-core -Force
+          Expand-Archive -Path $qtZip  -DestinationPath C:\obs-qt6  -Force
+
+          Write-Host "`n== core deps cmake dir =="; Get-ChildItem C:\obs-core\lib\cmake
+          Write-Host "`n== qt6  deps cmake dir =="; Get-ChildItem C:\obs-qt6\lib\cmake
+
+      - name: Configure (Ninja, verbose)
         shell: pwsh
-        run: |
-          $cmakeRoot = "$Env:ProgramFiles\obs-studio\cmake"
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_VERBOSE_MAKEFILE=ON `
-            -DCMAKE_PREFIX_PATH="$cmakeRoot" `
-            -Dlibobs_DIR="$cmakeRoot\libobs" `
-            -Dobs-frontend-api_DIR="$cmakeRoot\obs-frontend-api" `
-            --debug-find
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_VERBOSE_MAKEFILE=ON
+          -DCMAKE_PREFIX_PATH="C:\obs-core\lib\cmake;C:\obs-qt6\lib\cmake"
+          -Dlibobs_DIR="C:\obs-core\lib\cmake\libobs"
+          -Dobs-frontend-api_DIR="C:\obs-core\lib\cmake\obs-frontend-api"
+          --debug-find
 
       - name: Build
-        run: cmake --build build --config Release -v
+        run: cmake --build build --config Release -j
 
-      - name: Stage plugin
-        shell: pwsh
-        run: |
-          $Stage="stage\obs-plugins\64bit"
-          New-Item -Force -ItemType Directory $Stage | Out-Null
-          Copy-Item build\*.dll $Stage -Force -ErrorAction Stop
+      - name: Install to staging
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}\stage"
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-plugin
-          path: |
-            stage/**
-            build/**
+          name: obs-xbox-zoom-pan-windows
+          path: stage/obs-plugins/64bit/obs-xbox-zoom-pan.dll
+          if-no-files-found: warn
 
+      - name: Upload build dir and logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-and-logs
+          path: |
+            build/**
+            stage/**
+          if-no-files-found: ignore

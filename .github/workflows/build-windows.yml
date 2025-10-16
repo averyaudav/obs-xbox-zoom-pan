@@ -12,12 +12,10 @@ jobs:
       - name: Checkout plugin repo
         uses: actions/checkout@v4
 
-      - name: Install CMake + Ninja
+      - name: Install CMake
         uses: lukka/get-cmake@v3.30.3
 
-      # ---------------------------------------------
-      # 1) Grab latest obs-deps zips (core + Qt6)
-      # ---------------------------------------------
+      # 1) Download obs-deps (core + Qt6) so OBS & your dock can build/link
       - name: Download obs-deps (core + Qt6)
         shell: pwsh
         env:
@@ -26,7 +24,6 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           function Get-ObsDepsAsset([string]$pattern) {
-            # scan recent releases to avoid "latest" pointing to tag without assets
             $rels = Invoke-RestMethod `
               -Headers @{ "Authorization"="Bearer $env:GH_TOKEN"; "User-Agent"="obs-xbox-zoom-pan-ci" } `
               https://api.github.com/repos/obsproject/obs-deps/releases?per_page=25
@@ -37,8 +34,8 @@ jobs:
             throw "No asset matched: $pattern"
           }
 
-          $core = Get-ObsDepsAsset 'windows-deps-*-x64.zip'          # libav, other deps for obs
-          $qt6  = Get-ObsDepsAsset 'windows-deps-qt6-*-x64.zip'      # Qt 6 for UI
+          $core = Get-ObsDepsAsset 'windows-deps-*-x64.zip'      # core deps for obs
+          $qt6  = Get-ObsDepsAsset 'windows-deps-qt6-*-x64.zip'  # Qt 6
 
           Write-Host "Core deps: $($core.name)"
           Write-Host "Qt6  deps: $($qt6.name)"
@@ -53,22 +50,24 @@ jobs:
           Expand-Archive -Path $coreZip -DestinationPath C:\obs-core -Force
           Expand-Archive -Path $qtZip  -DestinationPath C:\obs-qt6  -Force
 
-          Write-Host "`n== obs-core cmake packages ==" ; Get-ChildItem C:\obs-core\lib\cmake
-          Write-Host "`n== obs-qt6  cmake packages ==" ; Get-ChildItem C:\obs-qt6\lib\cmake
+          Write-Host "`n== obs-core cmake =="
+          Get-ChildItem C:\obs-core\lib\cmake
+          Write-Host "`n== obs-qt6  cmake =="
+          Get-ChildItem C:\obs-qt6\lib\cmake
 
-      # ---------------------------------------------
-      # 2) Build a minimal OBS SDK (libobs + frontend)
-      # ---------------------------------------------
+      # 2) Build & install a minimal OBS SDK (MSVC + Windows SDK via VS generator)
       - name: Fetch obs-studio source
         run: git clone --depth 1 https://github.com/obsproject/obs-studio.git
 
-      - name: Configure obs-studio (minimal, Ninja)
+      - name: Configure obs-studio (Visual Studio generator)
         shell: pwsh
         run: >
-          cmake -S obs-studio -B obs-build -G Ninja
+          cmake -S obs-studio -B obs-build
+          -G "Visual Studio 17 2022" -A x64
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}\obs-sdk"
           -DCMAKE_PREFIX_PATH="C:\obs-core\lib\cmake;C:\obs-qt6\lib\cmake"
+          -DCMAKE_SYSTEM_VERSION=10.0
           -DBUILD_BROWSER=OFF
           -DBUILD_VLC=OFF
           -DBUILD_VST=OFF
@@ -78,28 +77,26 @@ jobs:
           -DENABLE_HEVC=OFF
 
       - name: Build + install obs-studio SDK (libobs + frontend)
-        shell: pwsh
         run: |
-          cmake --build obs-build --config Release --target libobs obs-frontend-api -j
-          cmake --build obs-build --config Release --target install
+          cmake --build obs-build --config Release --target libobs obs-frontend-api
+          cmake --build obs-build --config Release --target INSTALL
+        shell: pwsh
 
-          Write-Host "`n== Installed SDK cmake dir =="
-          Get-ChildItem -Recurse "${{ github.workspace }}\obs-sdk\cmake"
+      - name: Show installed SDK cmake dir
+        run: Get-ChildItem -Recurse "${{ github.workspace }}\obs-sdk\cmake"
+        shell: pwsh
 
-      # ---------------------------------------------
-      # 3) Build your plugin against the installed SDK
-      # ---------------------------------------------
-      - name: Configure plugin (Ninja, verbose)
+      # 3) Build YOUR plugin against that SDK (also with MSVC generator)
+      - name: Configure plugin (Visual Studio generator)
         shell: pwsh
         run: >
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build
+          -G "Visual Studio 17 2022" -A x64
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_VERBOSE_MAKEFILE=ON
           -DCMAKE_PREFIX_PATH="${{ github.workspace }}\obs-sdk\cmake;C:\obs-qt6\lib\cmake"
-          --debug-find
 
       - name: Build plugin
-        run: cmake --build build --config Release -j
+        run: cmake --build build --config Release
 
       - name: Stage install
         run: cmake --install build --config Release --prefix "${{ github.workspace }}\stage"

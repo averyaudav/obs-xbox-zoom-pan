@@ -15,8 +15,16 @@ jobs:
       - name: Install CMake + Ninja
         uses: lukka/get-cmake@v3.30.3
 
-      # Robust: scan recent releases for the newest win64-deps zip
-      - name: Download OBS deps (win64)
+      # 0) Install OBS Studio (provides libobs + obs-frontend-api CMake packages)
+      - name: Install OBS via winget
+        shell: pwsh
+        run: |
+          winget install -e --id OBSProject.OBSStudio --accept-source-agreements --accept-package-agreements --silent
+          "$Env:ProgramFiles\obs-studio\bin\64bit\obs64.exe" | Out-Null; $exit = $LASTEXITCODE
+          Write-Host "OBS installed under: $Env:ProgramFiles\obs-studio"
+
+      # 1) Download the latest *windows-deps-qt6* x64 bundle (Qt headers/libs) with a robust search
+      - name: Download OBS deps (windows-deps-qt6 x64)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -24,33 +32,33 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $releases = Invoke-RestMethod `
             -Headers @{ "Authorization" = "Bearer $env:GH_TOKEN"; "User-Agent"="obs-xbox-zoom-pan-ci" } `
-            https://api.github.com/repos/obsproject/obs-deps/releases?per_page=20
+            https://api.github.com/repos/obsproject/obs-deps/releases?per_page=25
 
           $asset = $null
           foreach ($rel in $releases) {
-            $cand = $rel.assets | Where-Object { $_.name -like 'win64-deps-*.zip' } | Select-Object -First 1
+            $cand = $rel.assets | Where-Object { $_.name -like 'windows-deps-qt6-*-x64.zip' } | Select-Object -First 1
             if ($cand) { $asset = $cand; break }
           }
-          if (-not $asset) { throw "No win64-deps asset found across recent releases." }
+          if (-not $asset) { throw "No windows-deps-qt6 *-x64.zip asset found across recent releases." }
 
           Write-Host "Using obs-deps asset:" $asset.name
-          $zip = "$env:RUNNER_TEMP\obs-deps.zip"
+          $zip = "$env:RUNNER_TEMP\obs-deps-qt6.zip"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
 
           New-Item -ItemType Directory -Force -Path C:\obs-deps | Out-Null
           Expand-Archive -Path $zip -DestinationPath C:\obs-deps -Force
-          Write-Host "`n== obs-deps tree =="
-          Get-ChildItem -Recurse -Depth 2 C:\obs-deps | Select-Object FullName
+          Write-Host "`n== obs-deps tree (top) =="; Get-ChildItem C:\obs-deps
 
+      # 2) Configure (point CMake at OBS + Qt6 deps)
       - name: Configure (Ninja, verbose)
         shell: pwsh
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_VERBOSE_MAKEFILE=ON
-          -DCMAKE_PREFIX_PATH="C:\obs-deps;C:\obs-deps\lib\cmake"
-          -Dlibobs_DIR="C:\obs-deps\lib\cmake\libobs"
-          -Dobs-frontend-api_DIR="C:\obs-deps\lib\cmake\obs-frontend-api"
+          -DCMAKE_PREFIX_PATH="$Env:ProgramFiles\obs-studio\cmake;C:\obs-deps;C:\obs-deps\lib\cmake"
+          -Dlibobs_DIR="$Env:ProgramFiles\obs-studio\cmake\libobs"
+          -Dobs-frontend-api_DIR="$Env:ProgramFiles\obs-studio\cmake\obs-frontend-api"
           --debug-find
 
       - name: Build
